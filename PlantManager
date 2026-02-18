@@ -1,0 +1,507 @@
+-- [[
+This is the plantManager module that handles every seeds in the game, with growing, ecc..
+]]
+
+
+local PlantManager = {}
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+local Utils = require(game.ServerScriptService:WaitForChild("Services"):WaitForChild("ServerInitializer").Utils)
+local Animator = require(script.Parent:WaitForChild("Animator"))
+local MoneyHandler = require(script.Parent:WaitForChild("MoneyHandler"))
+local ezVisuals = require(ReplicatedStorage.Shared.EasyVisuals)
+
+local DataService = require(script.Parent.Parent.Parent:WaitForChild("Datastore"):WaitForChild("DataService"))
+
+local PlotAssigner
+pcall(function()
+	PlotAssigner = require(script.Parent.Parent:WaitForChild("PlotAssigner"))
+end)
+
+local activePlants = setmetatable({}, { __mode = "k" }) 
+local playerOwnedObjects = {} 
+local rarityColors = {
+	["Common"] = Color3.fromRGB(255, 255, 255),
+	["Uncommon"] = Color3.fromRGB(0, 255, 0),
+	["Rare"] = Color3.fromRGB(0, 0, 255),
+	["Epic"] = Color3.fromRGB(163, 0, 163),
+	["Legendary"] = Color3.fromRGB(255, 215, 0),
+}
+
+local GrowEvent
+pcall(function()
+	local SharedPackets = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedPacket"))
+	GrowEvent = SharedPackets.GrowEvent
+end)
+
+local function trackObject(player, model, slot)
+	if not player or not model then return end
+	if not playerOwnedObjects[player] then playerOwnedObjects[player] = {} end
+	table.insert(playerOwnedObjects[player], { model = model, slot = slot })
+end
+
+local function cleanupPlayerObjects(player)
+	local tbl = playerOwnedObjects[player]
+	if not tbl then return end
+	for _, data in ipairs(tbl) do
+		local model = data.model
+		if MoneyHandler and MoneyHandler.UnregisterBrainrot then
+			pcall(function() MoneyHandler.UnregisterBrainrot(model) end)
+		end
+		if model and model.Parent then pcall(function() model:Destroy() end) end
+	end
+	playerOwnedObjects[player] = nil
+end
+
+local function findProgressTemplate()
+	local animator = script.Parent:FindFirstChild("Animator")
+	if animator and animator:FindFirstChild("Progress") then return animator.Progress end
+	local pd = ReplicatedStorage:FindFirstChild("PlantAssets")
+	if pd and pd:FindFirstChild("Progress") then return pd.Progress end
+	return nil
+end
+
+local function findProgressLabel(gui)
+	if not gui then return nil end
+	for _, d in ipairs(gui:GetDescendants()) do
+		if d:IsA("TextLabel") or d:IsA("TextBox") then return d end
+	end
+	return nil
+end
+
+local function setupAndPlayIdle(model)
+	if not model then return end
+
+	local animController = model:FindFirstChild("AnimationController")
+	local animsFolder = model:FindFirstChild("Anims")
+
+	if animController and animsFolder then
+		local animator = animController:FindFirstChild("Animator")
+		if not animator then 
+			animator = Instance.new("Animator")
+			animator.Parent = animController
+		end
+
+		local idleAnim = animsFolder:FindFirstChild("Idle")
+		if idleAnim and idleAnim:IsA("Animation") then
+			local track = animator:LoadAnimation(idleAnim)
+			track.Looped = true
+			track:Play()
+		end
+
+		pcall(function() animsFolder:Destroy() end)
+	end
+end
+
+function PlantManager.IsSlotOccupied(slot)
+	if not slot then return true end
+	if PlotAssigner and type(PlotAssigner.IsSlotOccupied) == "function" then
+		local ok, res = pcall(function() return PlotAssigner.IsSlotOccupied(slot) end)
+		if ok and res ~= nil then return res end
+	end
+	for _, child in ipairs(slot:GetChildren()) do
+		if child:IsA("Model") then return true end
+	end
+	return false
+end
+
+local manager = {
+	entries = {},  
+	conn = nil,
+	accumulator = 0,
+}
+
+local function manager_updateTick()
+	local now = os.time()
+	for seedInstance, entry in pairs(manager.entries) do
+		if not seedInstance or not seedInstance.Parent or not (entry.owner and entry.owner.Parent == Players) then
+			manager.entries[seedInstance] = nil
+			activePlants[seedInstance] = nil
+			continue
+		end
+
+		if now >= entry.endTime then
+			if not entry.isCompleting then
+				entry.isCompleting = true
+				task.spawn(function() 
+					pcall(function() PlantManager.ForceCompleteSeed(seedInstance) end)
+				end)
+			end
+		else
+			if not entry.isCompleting then
+				local remaining = math.max(0, math.floor(entry.endTime - now))
+				if GrowEvent and entry.owner and entry.owner.Parent then
+					pcall(function() GrowEvent:Fire(seedInstance, remaining) end)
+				end
+			end
+		end
+	end
+end
+
+local function manager_start()
+	if manager.conn then return end
+	manager.conn = RunService.Heartbeat:Connect(function(dt)
+		manager.accumulator = manager.accumulator + dt
+		if manager.accumulator >= 1 then
+			local ticks = math.floor(manager.accumulator)
+			manager.accumulator = manager.accumulator - ticks
+			for i = 1, ticks do
+				manager_updateTick()
+			end
+		end
+	end)
+end
+
+local function manager_stopIfEmpty()
+	if next(manager.entries) == nil then
+		if manager.conn then
+			manager.conn:Disconnect()
+			manager.conn = nil
+			manager.accumulator = 0
+		end
+	end
+end
+
+local function manager_addEntry(seedInstance, entry)
+	if not seedInstance or not entry then return end
+	manager.entries[seedInstance] = entry
+	manager_start()
+end
+
+local function manager_removeEntry(seedInstance)
+	if not seedInstance then return end
+	manager.entries[seedInstance] = nil
+	activePlants[seedInstance] = nil
+	manager_stopIfEmpty()
+end
+
+function PlantManager.PlantSeed(player, slot, seedClone, brainrotName, growTime, brainrotFolder, isLoading, manualSlotId)
+	if not player or not slot or not seedClone then return false, "invalid args" end
+	if PlantManager.IsSlotOccupied(slot) then return false, "occupied" end
+
+	local slotId = manualSlotId or (PlotAssigner and PlotAssigner.GetSlotId and pcall(function() return PlotAssigner.GetSlotId(slot.Parent) end) and PlotAssigner.GetSlotId(slot.Parent) or nil)
+
+	local endTime = os.time() + (growTime or 4)
+
+	if slotId and not isLoading then
+		local dataToSave = {
+			Name = brainrotName,
+			Stage = "Seed",
+			EndTime = endTime, 
+			SlotId = slotId
+		}
+		DataService.SetDictionaryItem(player, "Brainrots", slotId, dataToSave)
+	end
+
+	local centerPos = Utils.getCenterPositionOfInstance(slot) or Vector3.new(0,0,0)
+
+	local slotLookVector = Vector3.new(0,0,-1)
+	if slot:IsA("BasePart") then slotLookVector = slot.CFrame.LookVector
+	elseif slot:IsA("Model") and slot.PrimaryPart then slotLookVector = slot.PrimaryPart.CFrame.LookVector end
+
+	pcall(function()
+		Utils.ensurePrimaryPart(seedClone)
+		local targetCFrame = CFrame.lookAt(centerPos + Vector3.new(0, 0.45, 0), centerPos + Vector3.new(0, 0.45, 0) + slotLookVector)
+
+		if seedClone.PrimaryPart then seedClone:SetPrimaryPartCFrame(targetCFrame)
+		else
+			local firstPart
+			for _, d in ipairs(seedClone:GetDescendants()) do if d:IsA("BasePart") then firstPart = d; break end end
+			if firstPart then firstPart.CFrame = targetCFrame end
+		end
+	end)
+
+	seedClone.Parent = slot
+	Utils.anchorAllParts(seedClone)
+	trackObject(player, seedClone, slot)
+
+	local progressGui, progressLabel
+	local progressTemplate = findProgressTemplate()
+
+	if progressTemplate then
+		progressGui = progressTemplate:Clone()
+		progressGui.Name = "Progress"
+		progressGui.Parent = seedClone
+		progressLabel = findProgressLabel(progressGui)
+		if progressLabel then
+			progressLabel.Text = tostring(math.floor(growTime or 0))
+		end
+	end
+
+	local entry = {
+		owner = player,
+		slot = slot,
+		slotId = slotId,
+		brainrotName = brainrotName,
+		endTime = endTime,
+		brainrotFolder = brainrotFolder,
+		seed = seedClone,
+		progressGui = progressGui,
+		progressLabel = progressLabel,
+	}
+
+	activePlants[seedClone] = entry
+	manager_addEntry(seedClone, entry)
+
+	if GrowEvent and player and player.Parent then
+		pcall(function() GrowEvent:Fire(seedClone, math.floor(math.max(0, (entry.endTime - os.time())))) end)
+	end
+
+	return true
+end
+
+function PlantManager.LoadMaturePlant(player, slot, modelTemplate, brainrotName, mutations, lastSaveTime)
+	local finalClone = modelTemplate:Clone()
+
+	local centerPos = Utils.getCenterPositionOfInstance(slot)
+
+	local BillGui = script.Parent.Animator.BillGui
+
+	local slotLookVector = Vector3.new(0,0,-1)
+	if slot:IsA("BasePart") then
+		slotLookVector = slot.CFrame.LookVector
+	elseif slot:IsA("Model") and slot.PrimaryPart then
+		slotLookVector = slot.PrimaryPart.CFrame.LookVector
+	end
+
+	local slotHeight = 0
+	if slot:IsA("BasePart") then
+		slotHeight = slot.Size.Y
+	elseif slot:IsA("Model") and slot.PrimaryPart then
+		slotHeight = slot.PrimaryPart.Size.Y
+	else
+		slotHeight = Utils.getInstanceHeight(slot)
+	end
+
+	local brainrotHeight = 0
+	if finalClone.PrimaryPart then
+		brainrotHeight = finalClone.PrimaryPart.Size.Y
+	else
+		brainrotHeight = Utils.getInstanceHeight(finalClone)
+	end
+
+	local totalYOffset = (slotHeight / 2) + (brainrotHeight / 2)
+
+	local targetPos = centerPos + Vector3.new(0, totalYOffset, 0)
+	local targetCFrame = CFrame.lookAt(targetPos, targetPos + slotLookVector)
+
+	Utils.ensurePrimaryPart(finalClone)
+	if finalClone.PrimaryPart then
+		finalClone:SetPrimaryPartCFrame(targetCFrame)
+	else
+		finalClone:MoveTo(targetPos)
+	end
+
+	finalClone.Parent = slot
+	Utils.anchorAllParts(finalClone)
+	task.defer(function()
+		setupAndPlayIdle(finalClone)
+	end)
+
+	local slotId = nil
+	if PlotAssigner and type(PlotAssigner.GetSlotId) == "function" then
+		pcall(function()
+			slotId = PlotAssigner.GetSlotId(slot.Parent and slot.Parent.Parent or nil)
+		end)
+	end
+
+	if BillGui then
+		local bill = BillGui:Clone()
+		if bill then
+			bill.Name = "BillGui"
+			local mainFrame = bill:FindFirstChild("MainFrame") or bill:FindFirstChild("MainFrame", true)
+			if mainFrame then
+				local nameLabel = mainFrame:FindFirstChild("NameLabel")
+				local rarityLabel = mainFrame:FindFirstChild("Rarity")
+				local ServerStorage = game:GetService("ServerStorage")
+				local brainrotRoot = ServerStorage:FindFirstChild("Brainrot") or ServerStorage:FindFirstChild("Brainrots") or ServerStorage
+				local rarityName = "Unknown"
+				if brainrotRoot then
+					for _, rarityFolder in ipairs(brainrotRoot:GetChildren()) do
+						if rarityFolder:IsA("Folder") or rarityFolder:IsA("Model") then
+							for _, brainrot in ipairs(rarityFolder:GetChildren()) do
+								if finalClone:HasTag(tostring(brainrot.Name)) then
+									rarityName = rarityFolder.Name
+									if nameLabel then pcall(function() nameLabel.Text = brainrot.Name end) end
+									break
+								end
+							end
+						end
+					end
+				end
+				if rarityLabel then pcall(function() rarityLabel.Text = rarityName end) end
+				if rarityName == "Secret" then
+					ezVisuals.new(rarityLabel, "Secret", 0.5)
+				elseif rarityName == "Ultra" then
+					ezVisuals.new(rarityLabel, "ChromeStroke", 0.5)
+				elseif rarityName == "Mythic" then
+					rarityLabel.TextColor3 = Color3.fromRGB(159, 0, 0)
+					ezVisuals.new(rarityLabel, "DeathStroke", 0.5)
+				else
+					rarityLabel.TextColor3 = rarityColors[rarityName]
+				end
+			end
+			local parentPart = finalClone:FindFirstChild("Mesh", true) or finalClone.PrimaryPart
+			if parentPart and parentPart:IsA("BasePart") then
+				bill.Parent = parentPart
+				pcall(function() bill.Adornee = parentPart end)
+			else
+				bill.Parent = finalClone
+			end
+		end
+	end
+
+	local okExisting, existingEntry = pcall(function() return MoneyHandler.GetBrainrotData(finalClone) end)
+	if okExisting and existingEntry then
+		warn("LoadMaturePlant: money entry already exists for model (skipping Register):", tostring(finalClone))
+	else
+		local success, err = pcall(function() MoneyHandler.RegisterBrainrot(finalClone, player) end)
+		if not success then warn("LoadMaturePlant: failed to RegisterBrainrot:", err) end
+	end
+
+	if mutations and type(mutations) == "table" then
+		for _, mname in ipairs(mutations) do
+			if type(mname) == "string" and #mname > 0 then
+				pcall(function() MoneyHandler.AddMutation(finalClone, mname) end)
+			end
+		end
+	end
+
+	if lastSaveTime and type(lastSaveTime) == "number" and lastSaveTime > 0 then
+		local currentTime = os.time()
+		local timeDiff = currentTime - lastSaveTime
+
+		if timeDiff > 10 then
+			MoneyHandler.ApplyOfflineEarnings(finalClone, timeDiff)
+		end
+	end
+
+	trackObject(player, finalClone, slot)
+end
+
+local function completePlant(seedInstance, entry)
+	if not seedInstance or not entry then return end
+
+	local sId = tostring(entry.slotId)
+
+	if sId and entry.owner.Parent == Players then
+		local dataToSave = {
+			Name = entry.brainrotName,
+			Stage = "Brainrot",
+			EndTime = 0,
+			SlotId = sId
+		}
+		local success, err = pcall(function()
+			DataService.SetDictionaryItem(entry.owner, "Brainrots", sId, dataToSave)
+		end)
+		if not success then warn("PlantManager: failed to save brainrot data:", err) end
+	end
+
+	local finalFolder = nil
+	if entry.brainrotFolder and entry.brainrotFolder.Parent then finalFolder = entry.brainrotFolder
+	else
+		local brRoot = ServerStorage:FindFirstChild("Brainrots") or ServerStorage:FindFirstChild("Brainrot") or ServerStorage
+		if brRoot then finalFolder = brRoot:FindFirstChild(entry.brainrotName) end
+	end
+
+	if not finalFolder then
+		warn(("PlantManager: final folder missing for %s"):format(tostring(entry.brainrotName)))
+		if seedInstance then pcall(function() seedInstance:Destroy() end) end
+		manager_removeEntry(seedInstance)
+		return
+	end
+
+	local finalModelTemplate = Utils.findBrainrotModelInFolder(finalFolder)
+	if not finalModelTemplate then
+		warn(("PlantManager: final model template missing for %s"):format(tostring(entry.brainrotName)))
+		if seedInstance then pcall(function() seedInstance:Destroy() end) end
+		manager_removeEntry(seedInstance)
+		return
+	end
+
+	if entry.progressGui then pcall(function() entry.progressGui:Destroy() end) end
+
+	local ok, finalClone = pcall(function()
+		return Animator.animateSeedToFinal(script.Parent:FindFirstChild("Animator") or script.Parent, seedInstance, finalModelTemplate, entry.slot, entry.owner)
+	end)
+
+	if not ok or not finalClone then
+		warn("PlantManager: animation failed for ", entry.brainrotName)
+		if seedInstance then pcall(function() seedInstance:Destroy() end) end
+		manager_removeEntry(seedInstance)
+		return
+	end
+
+	task.defer(function()
+		setupAndPlayIdle(finalClone)
+	end)
+
+	trackObject(entry.owner, finalClone, entry.slot)
+
+	if GrowEvent and entry.owner and entry.owner.Parent then
+		pcall(function() GrowEvent:Fire(finalClone, 0) end)
+	end
+
+	manager_removeEntry(seedInstance)
+end
+
+function PlantManager.RemoveMaturePlant(player, slot)
+	if not slot then return end
+
+	local brainrotModel = nil
+	for _, child in ipairs(slot:GetChildren()) do
+		if child:IsA("Model") and child.Name == "Brainrot" then
+			brainrotModel = child
+			break
+		end
+	end
+
+	if brainrotModel then
+		if MoneyHandler and MoneyHandler.RemoveBrainrot then
+			MoneyHandler.RemoveBrainrot(brainrotModel, true)
+		end
+
+		if playerOwnedObjects[player] then
+			for i, data in ipairs(playerOwnedObjects[player]) do
+				if data.model == brainrotModel then
+					table.remove(playerOwnedObjects[player], i)
+					break
+				end
+			end
+		end
+
+		brainrotModel:Destroy()
+		return true
+	end
+	return false
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	cleanupPlayerObjects(player)
+	for seed, entry in pairs(activePlants) do
+		if entry.owner == player then
+			if seed and seed.Parent then pcall(function() seed:Destroy() end) end
+			manager_removeEntry(seed)
+		end
+	end
+end)
+
+function PlantManager.CleanupPlayer(player)
+	cleanupPlayerObjects(player)
+end
+
+function PlantManager.ForceCompleteSeed(seed)
+	local entry = activePlants[seed]
+	if entry then
+		completePlant(seed, entry)
+	end
+end
+
+function PlantManager.GetActivePlants()
+	return activePlants
+end
+
+return PlantManager
