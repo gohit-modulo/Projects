@@ -1,0 +1,248 @@
+-- [[
+This module script handles a seedSystem for growing brainrots, when the event to plant the seed is fired,
+the script checks if everythig is right, then it does call the function of the PlantManager to start the seed placement and growing system
+]]
+
+local SeedPlacer = {}
+
+local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local SharedPackets = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SharedPacket"))
+local PromptActivatedEvent = SharedPackets.PromptActivated
+local SellBrainrot = SharedPackets.SellBrainrot
+local BrainrotMoneyToSell = SharedPackets.BrainrotMoneyToSell
+
+local plotLoaded = game.ServerScriptService.PlotLoaded
+
+local Utils = require(game.ServerScriptService:WaitForChild("Services"):WaitForChild("ServerInitializer").Utils)
+local PlantManager = require(script.Parent:WaitForChild("PlantManager"))
+local PlotAssigner = require(script.Parent.Parent:WaitForChild("PlotAssigner"))
+local GrowthConfig = require(game.ServerScriptService.Config:WaitForChild("GrowthTimes"))
+local DataService = require(script.Parent.Parent.Parent:WaitForChild("Datastore"):WaitForChild("DataService"))
+local MoneyHandler = require(script.Parent.MoneyHandler)
+local NotifyModule = require(game.ServerScriptService.Packages.NotifyClient)
+
+local DEFAULT_GROWTH_TIME = GrowthConfig and GrowthConfig.default or 4
+
+local started = false
+local conn = nil
+
+local function getEquippedSeedTool(player)
+	if not player or not player.Character then return nil end
+	for _, child in ipairs(player.Character:GetChildren()) do
+		if child:IsA("Tool") then
+			local ok, attr = pcall(function() return child:GetAttribute("Seed") end)
+			if ok and attr ~= nil then return child end
+		end
+	end
+	return nil
+end
+
+local function isInstanceInsidePlayerPlot(player, inst)
+	if not player or not inst then return false end
+	if not PlotAssigner or not PlotAssigner.GetPlotForPlayer then return false end
+	local playerPlot = PlotAssigner.GetPlotForPlayer(player)
+	if not playerPlot then return false end
+	local cur = inst
+	while cur do
+		if cur == playerPlot then return true end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local function onPromptActivated(player, prompt)
+	if not player or not player.Parent then return end
+	if not prompt or not prompt.Parent then return end
+
+	local slot = prompt.Parent
+	if not isInstanceInsidePlayerPlot(player, slot) then return end
+	if PlantManager.IsSlotOccupied(slot) then return end
+
+	local equippedTool = getEquippedSeedTool(player)
+	if not equippedTool then return end
+
+	local brainrotFolder, storedTool = Utils.findBrainrotByToolName(equippedTool.Name)
+	if not brainrotFolder then return end
+
+	local seedModel = Utils.findSeedModelInBrainrot(brainrotFolder)
+	if not seedModel then return end
+
+	pcall(function() equippedTool:Destroy() end)
+
+	local seedClone = seedModel:Clone()
+
+	local brainrotName = nil
+	local ok, attr = pcall(function() return seedClone:GetAttribute("Brainrot") end)
+	if ok and attr and type(attr) == "string" and attr ~= "" then brainrotName = attr end
+	if not brainrotName then
+		local sv = seedClone:FindFirstChild("Brainrot")
+		if sv and sv:IsA("StringValue") and sv.Value ~= "" then brainrotName = sv.Value end
+	end
+	if not brainrotName then brainrotName = brainrotFolder.Name end
+
+	local growTime = GrowthConfig and GrowthConfig.times and GrowthConfig.times[brainrotName] or DEFAULT_GROWTH_TIME
+
+	PlantManager.PlantSeed(player, slot, seedClone, brainrotName, growTime, brainrotFolder, false)
+	NotifyModule.Notify(player, "Planted " ..brainrotName .." successfully!", 1)
+end
+
+local function onSellBrainrot(player, prompt)
+	if not player or not prompt or not prompt.Parent then return end
+
+	local slot = prompt.Parent
+	if not isInstanceInsidePlayerPlot(player, slot) then return end
+
+	local brainrotModel = nil
+	for _, child in ipairs(slot:GetChildren()) do
+		if child:IsA("Model") and child.Name == "Brainrot" then
+			brainrotModel = child
+			break
+		end
+	end
+
+	if not brainrotModel then return end
+
+	local sellPrice = 0
+	local entry = MoneyHandler.GetBrainrotData(brainrotModel)
+
+	if entry and entry.baseAmount then
+		sellPrice = math.floor(entry.baseAmount * 0.5)
+	end
+
+	local slotId = PlotAssigner.GetSlotId(slot.Parent)
+
+	local success = PlantManager.RemoveMaturePlant(player, slot)
+	if success then
+		if slotId then
+			DataService.RemoveDictionaryItem(player, "Brainrots", slotId)
+		end
+
+		if sellPrice > 0 then
+			DataService.Add(player, "Money", sellPrice)
+			NotifyModule.Notify(player, "Sold the brainrot successfully!", 1)
+		end
+	else
+		warn("SeedPlacer: RemoveMaturePlant has failed for player", player.Name, "slot", tostring(slot))
+	end
+end
+
+BrainrotMoneyToSell.OnServerInvoke = function(player, prompt)
+	if not player or not prompt or not prompt.Parent then
+		return 0
+	end
+
+	if not isInstanceInsidePlayerPlot(player, prompt.Parent) then
+		return 0
+	end
+
+	local brainrotModel = nil
+	for _, child in ipairs(prompt.Parent:GetChildren()) do
+		if child:IsA("Model") and child.Name == "Brainrot" then
+			brainrotModel = child
+			break
+		end
+	end
+	if not brainrotModel then
+		return 0
+	end
+
+	local ok, entry = pcall(function() return MoneyHandler.GetBrainrotData(brainrotModel) end)
+	local sellPrice = 0
+	if ok and entry and entry.baseAmount then
+		sellPrice = math.floor(entry.baseAmount * 0.5)
+	end
+
+	return sellPrice or 0
+end
+
+function SeedPlacer.Start()
+	if started then return end
+	started = true
+
+	conn = PromptActivatedEvent.OnServerEvent:Connect(onPromptActivated)
+
+	SeedPlacer._sellConn = SellBrainrot.OnServerEvent:Connect(onSellBrainrot)
+end
+
+function SeedPlacer.LoadPlayerData(player)
+	
+	local brainrotsData = DataService.GetBrainrotsData(player)
+	local playerPlot = PlotAssigner.GetPlotForPlayer(player)
+
+	local lastSaveTime = nil
+	pcall(function()
+		lastSaveTime = DataService.Get(player, "LastSave") 
+	end)
+		
+	if not playerPlot or not brainrotsData then 
+		print("SeedPlacer: Plot o BrainrotsData not found")
+		player:Kick("Your data has not been loaded. Please rejoin")
+		return 
+	end
+
+	for slotId, data in pairs(brainrotsData) do
+		local slot = PlotAssigner.GetSlotById(playerPlot, slotId)
+		if not slot then 
+			warn("SeedPlacer: Slot not found for ID " .. tostring(slotId))
+			continue 
+		end
+
+		if slot:FindFirstChild("Primary") then
+			slot = slot.Primary
+		end
+
+		local brRoot = ServerStorage:FindFirstChild("Brainrots")
+		local brainrotFolder
+		for i, rarityFolder in pairs(brRoot:GetDescendants()) do
+			if rarityFolder:IsA("Folder") and rarityFolder.Name == data.Name then
+				brainrotFolder = rarityFolder
+				break
+			end
+		end
+		if not brainrotFolder then
+			warn("SeedPlacer: Folder not found for " .. data.Name)
+			continue 
+		end
+
+		if data.Stage == "Seed" then
+			local seedModel = Utils.findSeedModelInBrainrot(brainrotFolder)
+			if seedModel then
+				local seedClone = seedModel:Clone()
+
+				local remainingTime = data.EndTime - os.time()
+
+				if remainingTime <= 0 then
+					remainingTime = 1.5
+				end
+				
+				PlantManager.PlantSeed(player, slot, seedClone, data.Name, remainingTime, brainrotFolder, true, slotId)
+			end
+
+		elseif data.Stage == "Brainrot" then
+			local finalModelTemplate = Utils.findBrainrotModelInFolder(brainrotFolder)
+			if finalModelTemplate then
+				local mutations = data.Mutations or {}
+				
+				PlantManager.LoadMaturePlant(player, slot, finalModelTemplate, data.Name, mutations, lastSaveTime)
+			else
+				warn("SeedPlacer: final model not found for " .. data.Name)
+			end
+		else
+			warn("SeedPlacer: Stage unknown: " .. data.Stage)
+		end
+	end
+end
+
+function SeedPlacer.Stop()
+	if conn then conn:Disconnect(); conn = nil end
+	if SeedPlacer._sellConn then SeedPlacer._sellConn:Disconnect(); SeedPlacer._sellConn = nil end
+	if BrainrotMoneyToSell then
+		BrainrotMoneyToSell.OnServerInvoke = nil
+	end
+	started = false
+end
+
+return SeedPlacer
